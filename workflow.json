@@ -1,0 +1,382 @@
+{
+  "name": "04 - Smart Invoice OCR Processor & Approval Flow",
+  "nodes": [
+    {
+      "id": "a4000001-0000-4000-8000-000000000001",
+      "name": "Watch Invoice Inbox",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [250, 300],
+      "parameters": {
+        "resource": "message",
+        "operation": "getAll",
+        "returnAll": false,
+        "limit": 10,
+        "filters": {
+          "q": "subject:(invoice OR \"payment due\" OR \"bill\") has:attachment newer_than:1d is:unread",
+          "labelIds": ["INBOX"]
+        },
+        "options": {
+          "downloadAttachments": true,
+          "attachmentsPrefix": "invoice_"
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_WITH_GMAIL_CREDENTIAL_ID",
+          "name": "Gmail OAuth2"
+        }
+      },
+      "polling": true,
+      "triggerPanel": {
+        "header": "Watch for invoice emails",
+        "executionsHelp": {
+          "inactive": "Watching for new invoice emails every minute",
+          "active": "Watching for new invoice emails every minute"
+        }
+      }
+    },
+    {
+      "id": "a4000001-0000-4000-8000-000000000002",
+      "name": "Split Emails",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [480, 300],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "id": "a4000001-0000-4000-8000-000000000003",
+      "name": "AI Extract Invoice Data",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1.4,
+      "position": [720, 300],
+      "parameters": {
+        "resource": "chat",
+        "operation": "complete",
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list"
+        },
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert accounts payable specialist. Extract all invoice data from the email and attachments. Return ONLY valid JSON:\n{\n  \"invoice_number\": \"string or null\",\n  \"vendor_name\": \"string\",\n  \"vendor_email\": \"string\",\n  \"invoice_date\": \"YYYY-MM-DD or null\",\n  \"due_date\": \"YYYY-MM-DD or null\",\n  \"subtotal\": number,\n  \"tax_amount\": number,\n  \"total_amount\": number,\n  \"currency\": \"USD|EUR|GBP|etc\",\n  \"line_items\": [{\"description\": \"\", \"quantity\": 0, \"unit_price\": 0, \"total\": 0}],\n  \"payment_terms\": \"string\",\n  \"bank_details\": {\"bank_name\": \"\", \"account_number\": \"\", \"routing\": \"\"},\n  \"purchase_order_ref\": \"string or null\",\n  \"notes\": \"string\",\n  \"confidence\": 0.0-1.0\n}\nIf data is unclear, use null. Set confidence based on how clear the invoice data was."
+            },
+            {
+              "role": "user",
+              "content": "Email Subject: {{ $json.subject }}\nFrom: {{ $json.from }}\nDate: {{ $json.date }}\nBody: {{ $json.text ?? $json.snippet }}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0,
+          "maxTokens": 1500
+        }
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_WITH_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI API"
+        }
+      }
+    },
+    {
+      "id": "a4000001-0000-4000-8000-000000000004",
+      "name": "Parse & Enrich Invoice",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 300],
+      "parameters": {
+        "jsCode": "const raw = $input.item.json.message?.content ?? '{}';\nlet invoice;\ntry { invoice = JSON.parse(raw); }\ncatch(e) { \n  const match = raw.match(/\\{[\\s\\S]*\\}/);\n  try { invoice = JSON.parse(match?.[0] ?? '{}'); }\n  catch { invoice = { vendor_name: 'Unknown', total_amount: 0, confidence: 0 }; }\n}\n\nconst emailData = $input.item.json;\nconst totalAmount = invoice.total_amount ?? 0;\n\n// Determine approval tier\nlet approval_tier;\nif (totalAmount <= 500) approval_tier = 'auto_approve';\nelse if (totalAmount <= 5000) approval_tier = 'manager';\nelse if (totalAmount <= 25000) approval_tier = 'director';\nelse approval_tier = 'cfo';\n\n// Generate internal invoice ID\nconst internal_id = 'INV-' + Date.now();\n\nreturn {\n  ...emailData,\n  invoice_data: invoice,\n  internal_id,\n  invoice_number: invoice.invoice_number,\n  vendor_name: invoice.vendor_name,\n  vendor_email: invoice.vendor_email,\n  invoice_date: invoice.invoice_date,\n  due_date: invoice.due_date,\n  total_amount: totalAmount,\n  currency: invoice.currency ?? 'USD',\n  approval_tier,\n  po_ref: invoice.purchase_order_ref,\n  confidence: invoice.confidence ?? 0,\n  low_confidence: (invoice.confidence ?? 1) < 0.7,\n  processed_at: new Date().toISOString(),\n  original_subject: emailData.subject,\n  original_from: emailData.from\n};"
+      }
+    },
+    {
+      "id": "a4000001-0000-4000-8000-000000000005",
+      "name": "Check Duplicate Invoice",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1200, 300],
+      "parameters": {
+        "operation": "select",
+        "schema": { "__rl": true, "value": "public", "mode": "list" },
+        "table": { "__rl": true, "value": "invoices", "mode": "list" },
+        "where": {
+          "values": [
+            {
+              "column": "invoice_number",
+              "value": "={{ $json.invoice_number }}"
+            },
+            {
+              "column": "vendor_name",
+              "value": "={{ $json.vendor_name }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL"
+        }
+      }
+    },
+    {
+      "id": "a4000001-0000-4000-8000-000000000006",
+      "name": "Is Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1440, 300],
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "dup1",
+              "leftValue": "={{ $json.length ?? 0 }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "a4000001-0000-4000-8000-000000000007",
+      "name": "Flag as Duplicate",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1680, 160],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": {
+          "__rl": true,
+          "value": "#finance-alerts",
+          "mode": "name"
+        },
+        "text": ":warning: Duplicate invoice detected",
+        "blocksUi": {
+          "blocksValues": [
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": ":warning: *Duplicate Invoice Detected*\n*Vendor:* {{ $json.vendor_name }}\n*Invoice #:* {{ $json.invoice_number }}\n*Amount:* {{ $json.currency }} {{ $json.total_amount }}\n*Original Email:* {{ $json.original_subject }}\n\nThis invoice appears to have been processed before. Please review manually."
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "REPLACE_WITH_SLACK_CREDENTIAL_ID",
+          "name": "Slack API"
+        }
+      }
+    },
+    {
+      "id": "a4000001-0000-4000-8000-000000000008",
+      "name": "Route by Approval Tier",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [1680, 380],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "outputKey": "0",
+              "conditions": {
+                "conditions": [{ "id": "ap1", "leftValue": "={{ $json.approval_tier }}", "rightValue": "auto_approve", "operator": { "type": "string", "operation": "equals" } }],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKeyLabel": "auto_approve"
+            },
+            {
+              "outputKey": "1",
+              "conditions": {
+                "conditions": [{ "id": "ap2", "leftValue": "={{ $json.approval_tier }}", "rightValue": "manager", "operator": { "type": "string", "operation": "equals" } }],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKeyLabel": "manager_approval"
+            }
+          ]
+        },
+        "fallbackOutput": "extra",
+        "options": {}
+      }
+    },
+    {
+      "id": "a4000001-0000-4000-8000-000000000009",
+      "name": "Auto-Approve Small Invoice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1920, 280],
+      "parameters": {
+        "method": "POST",
+        "url": "https://REPLACE_YOUR_ACCOUNTING_API/invoices",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ internal_id: $json.internal_id, invoice_number: $json.invoice_number, vendor_name: $json.vendor_name, vendor_email: $json.vendor_email, total_amount: $json.total_amount, currency: $json.currency, invoice_date: $json.invoice_date, due_date: $json.due_date, status: 'approved', approved_by: 'auto-system', approved_at: new Date().toISOString() }) }}",
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "a4000001-0000-4000-8000-000000000010",
+      "name": "Send Manager Approval Request",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [1920, 440],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "manager@REPLACE_YOUR_DOMAIN.com",
+        "subject": "[APPROVAL NEEDED] Invoice from {{ $json.vendor_name }} — {{ $json.currency }} {{ $json.total_amount }}",
+        "emailType": "html",
+        "message": "<h2>Invoice Approval Required</h2><p><strong>Vendor:</strong> {{ $json.vendor_name }}</p><p><strong>Invoice #:</strong> {{ $json.invoice_number }}</p><p><strong>Amount:</strong> {{ $json.currency }} {{ $json.total_amount }}</p><p><strong>Due Date:</strong> {{ $json.due_date }}</p><p><strong>Approval Tier:</strong> {{ $json.approval_tier }}</p><p><strong>Confidence:</strong> {{ Math.round($json.confidence * 100) }}%</p><hr/><p>Please review and approve or reject this invoice:</p><p><a href='https://REPLACE_YOUR_N8N_URL/webhook/invoice-approve?id={{ $json.internal_id }}&action=approve' style='background:#28a745;color:white;padding:10px 20px;text-decoration:none;border-radius:4px;margin-right:10px'>✓ Approve</a><a href='https://REPLACE_YOUR_N8N_URL/webhook/invoice-approve?id={{ $json.internal_id }}&action=reject' style='background:#dc3545;color:white;padding:10px 20px;text-decoration:none;border-radius:4px'>✗ Reject</a></p>",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_WITH_GMAIL_CREDENTIAL_ID",
+          "name": "Gmail OAuth2"
+        }
+      }
+    },
+    {
+      "id": "a4000001-0000-4000-8000-000000000011",
+      "name": "Send Senior Approval Request",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [1920, 580],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "cfo@REPLACE_YOUR_DOMAIN.com",
+        "subject": "[{{ $json.approval_tier.toUpperCase() }} APPROVAL] {{ $json.vendor_name }} — {{ $json.currency }} {{ $json.total_amount }}",
+        "emailType": "html",
+        "message": "<h2>Large Invoice Approval Required</h2><p>This invoice requires {{ $json.approval_tier }}-level approval.</p><p><strong>Vendor:</strong> {{ $json.vendor_name }}</p><p><strong>Invoice #:</strong> {{ $json.invoice_number }}</p><p><strong>Amount:</strong> {{ $json.currency }} {{ $json.total_amount }}</p><p><strong>Due Date:</strong> {{ $json.due_date }}</p><hr/><p><a href='https://REPLACE_YOUR_N8N_URL/webhook/invoice-approve?id={{ $json.internal_id }}&action=approve&tier={{ $json.approval_tier }}' style='background:#28a745;color:white;padding:10px 20px;text-decoration:none;border-radius:4px;margin-right:10px'>✓ Approve</a><a href='https://REPLACE_YOUR_N8N_URL/webhook/invoice-approve?id={{ $json.internal_id }}&action=reject&tier={{ $json.approval_tier }}' style='background:#dc3545;color:white;padding:10px 20px;text-decoration:none;border-radius:4px'>✗ Reject</a></p>",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_WITH_GMAIL_CREDENTIAL_ID",
+          "name": "Gmail OAuth2"
+        }
+      }
+    },
+    {
+      "id": "a4000001-0000-4000-8000-000000000012",
+      "name": "Save Invoice Record",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2160, 400],
+      "parameters": {
+        "operation": "insert",
+        "schema": { "__rl": true, "value": "public", "mode": "list" },
+        "table": { "__rl": true, "value": "invoices", "mode": "list" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "internal_id": "={{ $json.internal_id }}",
+            "invoice_number": "={{ $json.invoice_number }}",
+            "vendor_name": "={{ $json.vendor_name }}",
+            "vendor_email": "={{ $json.vendor_email }}",
+            "invoice_date": "={{ $json.invoice_date }}",
+            "due_date": "={{ $json.due_date }}",
+            "total_amount": "={{ $json.total_amount }}",
+            "currency": "={{ $json.currency }}",
+            "approval_tier": "={{ $json.approval_tier }}",
+            "status": "={{ $json.approval_tier === 'auto_approve' ? 'approved' : 'pending_approval' }}",
+            "ai_confidence": "={{ $json.confidence }}",
+            "processed_at": "={{ $json.processed_at }}"
+          }
+        },
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Watch Invoice Inbox": {
+      "main": [
+        [{ "node": "Split Emails", "type": "main", "index": 0 }]
+      ]
+    },
+    "Split Emails": {
+      "main": [
+        [{ "node": "AI Extract Invoice Data", "type": "main", "index": 0 }]
+      ]
+    },
+    "AI Extract Invoice Data": {
+      "main": [
+        [{ "node": "Parse & Enrich Invoice", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse & Enrich Invoice": {
+      "main": [
+        [{ "node": "Check Duplicate Invoice", "type": "main", "index": 0 }]
+      ]
+    },
+    "Check Duplicate Invoice": {
+      "main": [
+        [{ "node": "Is Duplicate?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Is Duplicate?": {
+      "main": [
+        [{ "node": "Flag as Duplicate", "type": "main", "index": 0 }],
+        [{ "node": "Route by Approval Tier", "type": "main", "index": 0 }]
+      ]
+    },
+    "Route by Approval Tier": {
+      "main": [
+        [{ "node": "Auto-Approve Small Invoice", "type": "main", "index": 0 }],
+        [{ "node": "Send Manager Approval Request", "type": "main", "index": 0 }],
+        [{ "node": "Send Senior Approval Request", "type": "main", "index": 0 }]
+      ]
+    },
+    "Auto-Approve Small Invoice": {
+      "main": [
+        [{ "node": "Save Invoice Record", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Manager Approval Request": {
+      "main": [
+        [{ "node": "Save Invoice Record", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Senior Approval Request": {
+      "main": [
+        [{ "node": "Save Invoice Record", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "id": "wf-smart-invoice-processor-v1",
+  "meta": {
+    "instanceId": "REPLACE_WITH_YOUR_N8N_INSTANCE_ID",
+    "templateCredsSetupCompleted": false
+  },
+  "tags": ["finance", "invoice", "ai", "approval", "accounts-payable", "production"]
+}
